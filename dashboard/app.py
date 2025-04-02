@@ -23,7 +23,7 @@ API_URL = os.getenv("API_URL", "http://localhost:9999")
 
 # 页面标题
 st.title("OpenHands-Starter Telemetry Dashboard")
-st.markdown("### Installation Telemetry Analytics")
+st.subheader("整体安装情况")
 
 # 在仪表板中添加日期选择器
 st.sidebar.header("筛选器")
