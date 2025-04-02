@@ -2,6 +2,7 @@
 from fastapi import APIRouter, HTTPException, status
 from datetime import datetime, timedelta
 from typing import Dict, Any, List
+import calendar
 
 from ..models.telemetry import TelemetryEvent, TelemetryStats
 from ..config.db import telemetry_collection
@@ -179,22 +180,227 @@ async def get_session_events(session_id: str):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to retrieve session events: {str(e)}"
         )
-
-@router.get("/recent")
-async def get_recent_sessions(limit: int = 10):
-    """获取最近的安装会话"""
+    
+# app/routers/telemetry.py 添加
+@router.get("/anomalies")
+async def get_anomalies():
+    """检测异常并返回告警"""
     try:
+        anomalies = await detect_failure_anomalies()
+        return {"anomalies": anomalies}
+    except Exception as e:
+        logger.error(f"Error detecting anomalies: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to detect anomalies: {str(e)}"
+        )
+
+@router.get("/trends")
+async def get_installation_trends(start_date: str = None):
+    """获取安装趋势数据，包括每日和每周安装量"""
+    try:
+        # 处理起始日期过滤
+        query = {}
+        if start_date:
+            try:
+                start = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
+                query["timestamp"] = {"$gte": start}
+            except (ValueError, TypeError):
+                pass
+        
+        # 按天统计安装数量
+        daily_pipeline = [
+            {"$match": {"step": "install", **query}},
+            {"$group": {
+                "_id": {
+                    "year": {"$year": "$timestamp"},
+                    "month": {"$month": "$timestamp"},
+                    "day": {"$dayOfMonth": "$timestamp"},
+                    "success": {"$cond": [
+                        {"$and": [
+                            {"$eq": ["$status", "completed"]},
+                            {"$eq": [{"$ifNull": ["$metrics.success", False]}, True]}
+                        ]},
+                        True,
+                        False
+                    ]}
+                },
+                "count": {"$sum": 1}
+            }},
+            {"$project": {
+                "_id": 0,
+                "date": {
+                    "$dateFromParts": {
+                        "year": "$_id.year",
+                        "month": "$_id.month",
+                        "day": "$_id.day"
+                    }
+                },
+                "success": "$_id.success",
+                "count": 1
+            }},
+            {"$sort": {"date": 1}}
+        ]
+        
+        daily_results = await telemetry_collection.aggregate(daily_pipeline).to_list(None)
+        
+        # 重新组织日期数据，计算每天的总安装数和成功率
+        daily_data = {}
+        for item in daily_results:
+            date_str = item["date"].strftime("%Y-%m-%d")
+            if date_str not in daily_data:
+                daily_data[date_str] = {"date": date_str, "count": 0, "successful": 0}
+            
+            daily_data[date_str]["count"] += item["count"]
+            if item["success"]:
+                daily_data[date_str]["successful"] += item["count"]
+        
+        # 计算成功率
+        daily_installs = []
+        for date_str, data in daily_data.items():
+            if data["count"] > 0:
+                data["success_rate"] = (data["successful"] / data["count"]) * 100
+            else:
+                data["success_rate"] = 0
+            daily_installs.append(data)
+        
+        # 按周统计安装数量（每周的开始日期为周一）
+        weekly_pipeline = [
+            {"$match": {"step": "install", **query}},
+            {"$group": {
+                "_id": {
+                    "year": {"$year": "$timestamp"},
+                    "week": {"$week": "$timestamp"}
+                },
+                "count": {"$sum": 1},
+                "firstDay": {"$min": "$timestamp"}
+            }},
+            {"$project": {
+                "_id": 0,
+                "week_start": "$firstDay",
+                "year": "$_id.year",
+                "week": "$_id.week",
+                "count": 1
+            }},
+            {"$sort": {"year": 1, "week": 1}}
+        ]
+        
+        weekly_results = await telemetry_collection.aggregate(weekly_pipeline).to_list(None)
+        
+        # 确保每周的开始日期是周一
+        weekly_installs = []
+        for item in weekly_results:
+            # 获取周开始日期（周一）
+            week_start = item["week_start"]
+            # 调整到当周的周一
+            while week_start.weekday() != 0:  # 0代表周一
+                week_start = week_start - timedelta(days=1)
+            
+            weekly_installs.append({
+                "week_start": week_start.strftime("%Y-%m-%d"),
+                "count": item["count"]
+            })
+        
+        return {
+            "daily_installs": daily_installs,
+            "weekly_installs": weekly_installs
+        }
+    
+    except Exception as e:
+        logger.error(f"Error generating installation trends: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to generate installation trends: {str(e)}"
+        )
+
+@router.get("/users")
+async def get_users_statistics(start_date: str = None):
+    """获取用户统计数据，包括独立用户数和活跃度"""
+    try:
+        # 处理起始日期过滤
+        query = {}
+        if start_date:
+            try:
+                start = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
+                query["timestamp"] = {"$gte": start}
+            except (ValueError, TypeError):
+                pass
+        
+        # 统计独立用户数（基于anonymousId）
+        unique_users = await telemetry_collection.distinct("anonymousId", query)
+        unique_count = len([uid for uid in unique_users if uid])  # 过滤掉空值
+        
+        # 统计活跃用户（在选定时间段内有多次安装行为的用户）
+        active_pipeline = [
+            {"$match": {
+                "step": "install",
+                "status": "completed",
+                "anonymousId": {"$ne": None},
+                **query
+            }},
+            {"$group": {
+                "_id": "$anonymousId",
+                "session_count": {"$sum": 1},
+                "last_seen": {"$max": "$timestamp"}
+            }},
+            {"$sort": {"session_count": -1}}
+        ]
+        
+        user_sessions = await telemetry_collection.aggregate(active_pipeline).to_list(None)
+        
+        # 计算重复安装的用户数量
+        returning_users = len([u for u in user_sessions if u["session_count"] > 1])
+        
+        # 计算每用户平均安装次数
+        total_sessions = sum(u["session_count"] for u in user_sessions)
+        avg_sessions = total_sessions / unique_count if unique_count > 0 else 0
+        
+        # 定义活跃用户：在过去30天内有任何活动的用户
+        now = datetime.utcnow()
+        thirty_days_ago = now - timedelta(days=30)
+        active_users = len([u for u in user_sessions if u["last_seen"] > thirty_days_ago])
+        
+        return {
+            "unique_users": unique_count,
+            "active_users": active_users,
+            "returning_users": returning_users,
+            "avg_sessions_per_user": avg_sessions,
+            "total_sessions": total_sessions
+        }
+    
+    except Exception as e:
+        logger.error(f"Error generating user statistics: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to generate user statistics: {str(e)}"
+        )
+
+# 增强get_recent_sessions函数，支持日期和成功状态过滤
+@router.get("/recent")
+async def get_recent_sessions(limit: int = 10, start_date: str = None, success: bool = None):
+    """获取最近的安装会话，支持日期和成功状态过滤"""
+    try:
+        # 构建查询条件
+        match_query = {"step": "install"}
+        
+        # 处理日期过滤
+        if start_date:
+            try:
+                start = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
+                match_query["timestamp"] = {"$gte": start}
+            except (ValueError, TypeError):
+                pass
+        
         # 获取最近安装完成的会话
         pipeline = [
-            {"$match": {"step": "install"}},
+            {"$match": match_query},
             {"$sort": {"timestamp": -1}},
             {"$group": {
                 "_id": "$sessionId",
                 "lastEvent": {"$first": "$$ROOT"},
                 "timestamp": {"$first": "$timestamp"}
             }},
-            {"$sort": {"timestamp": -1}},
-            {"$limit": limit}
+            {"$sort": {"timestamp": -1}}
         ]
         
         recent_sessions = await telemetry_collection.aggregate(pipeline).to_list(None)
@@ -205,9 +411,13 @@ async def get_recent_sessions(limit: int = 10):
             session_id = session["_id"]
             
             # 获取该会话的安装成功/失败状态
-            success = False
+            is_success = False
             if session["lastEvent"]["status"] == "completed" and session["lastEvent"].get("metrics", {}).get("success", False):
-                success = True
+                is_success = True
+            
+            # 应用成功状态过滤（如果指定）
+            if success is not None and is_success != success:
+                continue
                 
             # 获取系统信息
             system_info = await telemetry_collection.find_one(
@@ -238,11 +448,15 @@ async def get_recent_sessions(limit: int = 10):
             results.append({
                 "session_id": session_id,
                 "timestamp": session["timestamp"],
-                "success": success,
+                "success": is_success,
                 "os": os_info,
                 "duration_seconds": duration
             })
             
+            # 应用数量限制
+            if len(results) >= limit:
+                break
+                
         return results
     
     except Exception as e:
@@ -250,18 +464,4 @@ async def get_recent_sessions(limit: int = 10):
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to retrieve recent sessions: {str(e)}"
-        )
-    
-# app/routers/telemetry.py 添加
-@router.get("/anomalies")
-async def get_anomalies():
-    """检测异常并返回告警"""
-    try:
-        anomalies = await detect_failure_anomalies()
-        return {"anomalies": anomalies}
-    except Exception as e:
-        logger.error(f"Error detecting anomalies: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to detect anomalies: {str(e)}"
         )
