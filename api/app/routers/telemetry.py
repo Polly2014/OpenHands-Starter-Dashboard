@@ -66,11 +66,10 @@ async def get_telemetry_stats():
         # 获取会话总数
         total_sessions = len(await telemetry_collection.distinct("sessionId"))
         
-        # 获取成功安装数
+        # 获取成功安装数 - 修改规则为 step=deploy, status=success
         completed_installs = await telemetry_collection.count_documents({
-            "step": "install",
-            "status": "completed",
-            "metrics.success": True
+            "step": "deploy",
+            "status": "success"
         })
         
         # 计算成功率
@@ -112,7 +111,10 @@ async def get_telemetry_stats():
         # 计算平均安装时间
         time_pipeline = [
             {"$match": {
-                "step": "install"
+                "$or": [
+                    {"step": "install"},  # 保留 install 步骤用于计算安装时间
+                    {"step": "deploy"}    # 添加 deploy 步骤用于计算安装时间
+                ]
             }},
             {"$group": {
                 "_id": "$sessionId",
@@ -208,9 +210,15 @@ async def get_installation_trends(start_date: str = None):
             except (ValueError, TypeError):
                 pass
         
-        # 按天统计安装数量
+        # 按天统计安装数量 - 修改成功条件为 step=deploy, status=success
         daily_pipeline = [
-            {"$match": {"step": "install", **query}},
+            {"$match": {
+                "$or": [
+                    {"step": "install"},  # 保留 install 步骤用于计算总安装量
+                    {"step": "deploy"}    # 添加 deploy 步骤用于计算成功安装
+                ],
+                **query
+            }},
             {"$group": {
                 "_id": {
                     "year": {"$year": "$timestamp"},
@@ -218,8 +226,8 @@ async def get_installation_trends(start_date: str = None):
                     "day": {"$dayOfMonth": "$timestamp"},
                     "success": {"$cond": [
                         {"$and": [
-                            {"$eq": ["$status", "completed"]},
-                            {"$eq": [{"$ifNull": ["$metrics.success", False]}, True]}
+                            {"$eq": ["$step", "deploy"]},
+                            {"$eq": ["$status", "success"]}
                         ]},
                         True,
                         False
@@ -330,11 +338,11 @@ async def get_users_statistics(start_date: str = None):
         unique_users = await telemetry_collection.distinct("anonymousId", query)
         unique_count = len([uid for uid in unique_users if uid])  # 过滤掉空值
         
-        # 统计活跃用户（在选定时间段内有多次安装行为的用户）
+        # 统计活跃用户 - 修改为使用 step=deploy, status=success 的条件
         active_pipeline = [
             {"$match": {
-                "step": "install",
-                "status": "completed",
+                "step": "deploy",
+                "status": "success",
                 "anonymousId": {"$ne": None},
                 **query
             }},
@@ -380,7 +388,7 @@ async def get_users_statistics(start_date: str = None):
 async def get_recent_sessions(limit: int = 10, start_date: str = None, success: bool = None):
     """获取最近的安装会话，支持日期和成功状态过滤"""
     try:
-        # 构建查询条件
+        # 构建查询条件 - 保持查询 install 步骤来获取所有会话
         match_query = {"step": "install"}
         
         # 处理日期过滤
@@ -410,10 +418,14 @@ async def get_recent_sessions(limit: int = 10, start_date: str = None, success: 
         for session in recent_sessions:
             session_id = session["_id"]
             
-            # 获取该会话的安装成功/失败状态
-            is_success = False
-            if session["lastEvent"]["status"] == "completed" and session["lastEvent"].get("metrics", {}).get("success", False):
-                is_success = True
+            # 检查是否有成功的 deploy 事件来判断成功状态
+            deploy_success_event = await telemetry_collection.find_one({
+                "sessionId": session_id,
+                "step": "deploy",
+                "status": "success"
+            })
+            
+            is_success = bool(deploy_success_event)
             
             # 应用成功状态过滤（如果指定）
             if success is not None and is_success != success:
@@ -465,3 +477,69 @@ async def get_recent_sessions(limit: int = 10, start_date: str = None, success: 
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to retrieve recent sessions: {str(e)}"
         )
+
+@router.get("/debug_session/{session_id}")
+async def debug_session(session_id: str):
+    """调试特定会话的成功状态和所有事件"""
+    try:
+        # 获取该会话的所有事件
+        events = await telemetry_collection.find({"sessionId": session_id}).sort("timestamp", 1).to_list(None)
+        
+        if not events:
+            return {"status": "No events found for this session"}
+        
+        # 处理所有事件的ObjectId
+        all_events = []
+        for event in events:
+            event_copy = {k: v for k, v in event.items() if k != "_id"}
+            event_copy["_id"] = str(event["_id"])
+            all_events.append(event_copy)
+        
+        # 查找安装和部署事件
+        install_events = [e for e in events if e.get("step") == "install"]
+        deploy_events = [e for e in events if e.get("step") == "deploy"]
+        
+        # 检查是否有成功的部署事件
+        deploy_success_events = [e for e in deploy_events if e.get("status") == "success"]
+        
+        # 分析安装事件（保留旧指标以供参考）
+        install_results = []
+        for event in install_events:
+            metrics = event.get("metrics", {})
+            success_exists = "success" in metrics
+            success_value = metrics.get("success")
+            
+            install_results.append({
+                "event_id": str(event["_id"]),
+                "timestamp": event.get("timestamp"),
+                "status": event.get("status"),
+                "success_field_exists": success_exists,
+                "success_value": success_value,
+                "success_type": str(type(success_value)),
+                "would_count_as_success_old_rule": success_exists and success_value is True
+            })
+        
+        # 分析部署事件（新规则）
+        deploy_results = []
+        for event in deploy_events:
+            deploy_results.append({
+                "event_id": str(event["_id"]),
+                "timestamp": event.get("timestamp"),
+                "status": event.get("status"),
+                "would_count_as_success_new_rule": event.get("status") == "success"
+            })
+            
+        return {
+            "session_id": session_id,
+            "total_events": len(events),
+            "has_install_events": len(install_events) > 0,
+            "has_deploy_events": len(deploy_events) > 0,
+            "has_deploy_success_events": len(deploy_success_events) > 0,
+            "is_success_by_new_rule": len(deploy_success_events) > 0,
+            "install_events_analysis": install_results,
+            "deploy_events_analysis": deploy_results,
+            "all_events": all_events
+        }
+    
+    except Exception as e:
+        return {"error": str(e)}
