@@ -903,6 +903,13 @@ with tab_installation:
         st.info("暂无最近会话数据")
 
 with tab_user:
+    # 刷新按钮
+    col1, col2 = st.columns([1, 15])
+    with col1:
+        if st.button("🔄 刷新"):
+            st.cache_data.clear()
+            st.success("数据已刷新!")
+
     start_date = filter_by_date(date_filter)
 
     # 显示当前筛选器状态
