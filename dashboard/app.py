@@ -421,16 +421,21 @@ st.sidebar.header("筛选器")
 date_options = ["最近7天", "最近30天", "最近90天", "全部"]
 date_filter = st.sidebar.selectbox("时间范围", date_options)
 
+# 添加会话状态筛选器
+status_options = ["全部", "成功", "失败"]
+session_status_filter = st.sidebar.multiselect(
+    "会话状态",
+    options=status_options,
+    default=["全部"]
+)
+
+if "全部" in session_status_filter and len(session_status_filter) > 1:
+    # 如果同时选择了"全部"和其他选项，则只保留"全部"
+    session_status_filter = ["全部"]
+
 with tab_installation:
 
     st.subheader("整体安装情况")
-
-    # 添加会话状态筛选器
-    session_status_filter = st.sidebar.multiselect(
-        "安装状态过滤", 
-        options=["全部", "成功", "失败"], 
-        default=["全部"]
-    )
 
     # 刷新按钮
     col1, col2 = st.columns([1, 15])
@@ -458,7 +463,9 @@ with tab_installation:
 
     # 显示KPI卡片
     if stats:
-        col1, col2, col3, col4 = st.columns(4)
+        # 第一行KPI卡片 - 主要指标
+        col1, col2, col3, col4, col5 = st.columns(5)
+        
         with col1:
             st.metric("总安装次数", stats['total_sessions'])
         with col2:
@@ -466,150 +473,99 @@ with tab_installation:
         with col3:
             st.metric("成功率", f"{stats['success_rate']:.1f}%")
         with col4:
-            # 如果有独立用户数据，则显示独立用户数
-            if users_data and 'unique_users' in users_data:
-                st.metric("独立安装用户", users_data['unique_users'])
+            st.metric("平均安装时间", f"{stats['avg_install_time']:.1f} 秒")
+        with col5:
+            if users_data and 'avg_sessions_per_user' in users_data:
+                st.metric("平均每用户安装次数", f"{users_data['avg_sessions_per_user']:.1f}")
             else:
-                st.metric("平均安装时间", f"{stats['avg_install_time']:.1f} 秒")
+                st.metric("独立安装用户", users_data.get('unique_users', 0) if users_data else 0)
                 
-        # 如果有用户数据且包含活跃用户指标，则添加额外的KPI行
-        if users_data and 'active_users' in users_data:
-            st.subheader("用户活跃度")
-            col1, col2, col3, col4 = st.columns(4)
+        # 第二行KPI卡片 - 时间段指标
+        if trend_data and 'summary' in trend_data:
+            summary = trend_data['summary']
+            st.subheader("时段安装情况")
+            col1, col2, col3 = st.columns(3)
+            
             with col1:
-                st.metric("活跃用户数", users_data['active_users'])
+                today = summary.get('today', {})
+                st.metric(
+                    "今日安装", 
+                    f"{today.get('successful', 0)}/{today.get('total', 0)}",
+                    help="格式：成功安装/总安装"
+                )
             with col2:
-                st.metric("平均安装时间", f"{stats['avg_install_time']:.1f} 秒")
+                this_week = summary.get('this_week', {})
+                st.metric(
+                    "本周安装", 
+                    f"{this_week.get('successful', 0)}/{this_week.get('total', 0)}",
+                    help="格式：成功安装/总安装"
+                )
             with col3:
-                if 'returning_users' in users_data:
-                    st.metric("重复安装用户", users_data['returning_users'])
-            with col4:
-                if 'avg_sessions_per_user' in users_data:
-                    st.metric("每用户平均安装次数", f"{users_data['avg_sessions_per_user']:.1f}")
+                this_month = summary.get('this_month', {})
+                st.metric(
+                    "本月安装", 
+                    f"{this_month.get('successful', 0)}/{this_month.get('total', 0)}",
+                    help="格式：成功安装/总安装"
+                )
 
         # 显示安装趋势图
         if trend_data:
-            st.subheader("安装数量趋势分析")
-            
-            # 创建三列布局
-            metrics_col1, metrics_col2, metrics_col3 = st.columns(3)
-            
-            # 添加当日和前一日安装数据比较
-            with metrics_col1:
-                # 计算当日和前一日的安装数
-                if 'daily_installs' in trend_data and len(trend_data['daily_installs']) > 1:
-                    today_data = trend_data['daily_installs'][-1]
-                    yesterday_data = trend_data['daily_installs'][-2]
-                    today_count = today_data.get('count', 0)
-                    yesterday_count = yesterday_data.get('count', 0)
-                    delta = today_count - yesterday_count
-                    delta_percent = f"{delta/yesterday_count*100:.1f}%" if yesterday_count > 0 else "N/A"
-                    
-                    st.metric(
-                        "今日安装", 
-                        today_count,
-                        delta=delta_percent,
-                        delta_color="normal"
-                    )
-                else:
-                    st.metric("今日安装", "无数据")
-            
-            # 添加本周和上周安装数据比较
-            with metrics_col2:
-                if 'weekly_installs' in trend_data and len(trend_data['weekly_installs']) > 1:
-                    this_week = trend_data['weekly_installs'][-1]
-                    last_week = trend_data['weekly_installs'][-2]
-                    this_week_count = this_week.get('count', 0)
-                    last_week_count = last_week.get('count', 0)
-                    delta = this_week_count - last_week_count
-                    delta_percent = f"{delta/last_week_count*100:.1f}%" if last_week_count > 0 else "N/A"
-                    
-                    st.metric(
-                        "本周安装", 
-                        this_week_count,
-                        delta=delta_percent,
-                        delta_color="normal"
-                    )
-                else:
-                    st.metric("本周安装", "无数据")
-            
-            # 添加平均每日安装数
-            with metrics_col3:
-                if 'daily_installs' in trend_data and trend_data['daily_installs']:
-                    daily_counts = [day.get('count', 0) for day in trend_data['daily_installs']]
-                    if daily_counts:
-                        avg_daily = sum(daily_counts) / len(daily_counts)
-                        st.metric("平均每日安装", f"{avg_daily:.1f}")
-                    else:
-                        st.metric("平均每日安装", "无数据")
-                else:
-                    st.metric("平均每日安装", "无数据")
+            st.subheader("安装趋势分析")
             
             # 创建tab布局用于切换不同周期的图表
             trend_tab1, trend_tab2, trend_tab3 = st.tabs(["日趋势", "周趋势", "月趋势"])
             
-            # 处理趋势数据
+            # 处理日趋势数据
             with trend_tab1:
                 if 'daily_installs' in trend_data and trend_data['daily_installs']:
                     trend_df = pd.DataFrame(trend_data['daily_installs'])
                     trend_df['date'] = pd.to_datetime(trend_df['date'])
                     
-                    # 创建每日趋势图 - 优化样式
-                    fig_daily = px.line(
-                        trend_df,
-                        x='date',
-                        y='count',
-                        title='每日安装数量',
-                        labels={'date': '日期', 'count': '安装数量'},
-                        line_shape='spline',  # 使线条更平滑
-                        markers=True  # 显示数据点
-                    )
+                    # 创建每日趋势图 - 显示总安装量和成功安装量
+                    fig_daily = go.Figure()
                     
-                    # 自定义线条样式
-                    fig_daily.update_traces(
-                        line=dict(width=3, color='#1E88E5'),  # 蓝色粗线
-                        marker=dict(size=6, color='#1E88E5', line=dict(width=1, color='white'))  # 数据点样式
-                    )
-                    
-                    # 添加成功率曲线（如果存在）
-                    if 'success_rate' in trend_df.columns:
-                        fig_daily.add_trace(
-                            go.Scatter(
-                                x=trend_df['date'],
-                                y=trend_df['success_rate'],
-                                mode='lines+markers',
-                                name='成功率',
-                                yaxis='y2',
-                                line=dict(color='#43A047', width=2, shape='spline', dash='dot'),  # 绿色虚线
-                                marker=dict(size=5, color='#43A047', symbol='diamond')  # 菱形标记
-                            )
-                        )
-                        
-                        # 添加第二个Y轴 - 更好的样式
-                        fig_daily.update_layout(
-                            yaxis2=dict(
-                                title='成功率 (%)',
-                                overlaying='y',
-                                side='right',
-                                range=[0, 100],
-                                showgrid=False
-                            )
-                        )
-                    
-                    # 添加区域填充，使图表更具视觉效果
+                    # 添加总安装量线条 - 带填充区域
                     fig_daily.add_trace(
                         go.Scatter(
                             x=trend_df['date'],
-                            y=trend_df['count'],
-                            mode='none',
+                            y=trend_df['total'],
+                            name='总安装量',
+                            line=dict(width=3, color='#1E88E5'),
+                            mode='lines+markers',
+                            marker=dict(size=6, color='#1E88E5', line=dict(width=1, color='white')),
                             fill='tozeroy',
-                            fillcolor='rgba(30, 136, 229, 0.1)',  # 半透明蓝色
-                            name='安装总量',
-                            showlegend=False
+                            fillcolor='rgba(30, 136, 229, 0.2)'
                         )
                     )
                     
-                    # 美化图表 - 修复布局参数
+                    # 添加成功安装量线条 - 带填充区域
+                    fig_daily.add_trace(
+                        go.Scatter(
+                            x=trend_df['date'],
+                            y=trend_df['successful'],
+                            name='成功安装',
+                            line=dict(width=3, color='#4CAF50'),
+                            mode='lines+markers',
+                            marker=dict(size=6, color='#4CAF50', line=dict(width=1, color='white')),
+                            fill='tozeroy',
+                            fillcolor='rgba(76, 175, 80, 0.2)'
+                        )
+                    )
+                    
+                    # 添加成功率线条，仿照月趋势图
+                    fig_daily.add_trace(
+                        go.Scatter(
+                            x=trend_df['date'],
+                            y=trend_df['success_rate'],
+                            name='成功率 (%)',
+                            line=dict(width=3, color='#FF9800', dash='dot'),
+                            mode='lines+markers',
+                            marker=dict(size=6, color='#FF9800'),
+                            yaxis='y2'
+                        )
+                    )
+                    
+                    # 美化图表，添加双Y轴
                     fig_daily.update_layout(
                         xaxis_title='日期',
                         yaxis_title='安装数量',
@@ -625,266 +581,231 @@ with tab_installation:
                         yaxis=dict(
                             showgrid=True,
                             gridcolor='rgba(211, 211, 211, 0.5)',
-                            zeroline=False
+                            zeroline=False,
+                            title='安装数量'
                         ),
-                        margin=dict(l=10, r=10, b=10, t=50),
+                        yaxis2=dict(
+                            title='成功率 (%)',
+                            overlaying='y',
+                            side='right',
+                            range=[0, 100],
+                            ticksuffix='%'
+                        ),
+                        margin=dict(l=10, r=50, b=10, t=50),
                         legend=dict(
-                            orientation="v",  # 垂直方向排列
-                            xanchor="right",  # 右对齐
-                            x=0.99,  # 靠右边缘
-                            yanchor="top",    # 顶部对齐
-                            y=0.99,  # 靠顶部边缘
-                            bgcolor="rgba(255,255,255,0.8)",  # 半透明白色背景
-                            bordercolor="rgba(211,211,211,0.5)",  # 浅灰色边框
-                            borderwidth=1
+                            orientation="h",
+                            xanchor="right",
+                            x=1.0,
+                            yanchor="top",
+                            y=1.0
                         ),
-                        title_text='每日安装数量',  # 使用title_text代替嵌套字典
+                        title_text='每日安装量与成功率',
                         title_y=0.95,
                         title_x=0.5,
                         title_xanchor='center',
-                        title_yanchor='top',
+                        title_yanchor='top'
                     )
                     
                     st.plotly_chart(fig_daily, use_container_width=True)
                 else:
                     st.info("暂无每日安装数据")
             
-            # 周趋势图 - 优化样式
+            # 处理周趋势数据
             with trend_tab2:
                 if 'weekly_installs' in trend_data and trend_data['weekly_installs']:
                     weekly_df = pd.DataFrame(trend_data['weekly_installs'])
                     weekly_df['week'] = pd.to_datetime(weekly_df['week_start'])
                     
-                    # 创建周趋势图
-                    fig_weekly = px.bar(
-                        weekly_df,
-                        x='week',
-                        y='count',
-                        title='每周安装总量',
-                        labels={'week': '周开始日期', 'count': '安装数量'},
-                        text='count'  # 在柱状图上显示数值
-                    )
+                    # 创建周趋势图 - 改为折线图带填充
+                    fig_weekly = go.Figure()
                     
-                    # 设置柱状图样式
-                    fig_weekly.update_traces(
-                        marker_color='rgba(76, 175, 80, 0.7)',  # 半透明绿色
-                        marker_line_color='#2E7D32',  # 深绿色轮廓
-                        marker_line_width=1.5,
-                        textposition='outside',  # 文本位置
-                        texttemplate='%{text}',  # 文本显示格式
-                    )
-                    
-                    # 添加更好看的趋势线
+                    # 添加总安装量线条 - 带填充区域
                     fig_weekly.add_trace(
                         go.Scatter(
                             x=weekly_df['week'],
-                            y=weekly_df['count'],
+                            y=weekly_df['total'],
+                            name='总安装量',
+                            line=dict(width=3, color='#1E88E5'),
                             mode='lines+markers',
-                            line=dict(color='#FF5722', width=2, shape='spline'),  # 橙色曲线
-                            marker=dict(
-                                size=8,
-                                symbol='circle',
-                                color='#FF5722',
-                                line=dict(color='white', width=1)
-                            ),
-                            name='周趋势'
+                            marker=dict(size=8, color='#1E88E5', line=dict(width=1, color='white')),
+                            fill='tozeroy',
+                            fillcolor='rgba(30, 136, 229, 0.2)'
                         )
                     )
                     
-                    # 增强图表样式 - 使用与日趋势图相同的参数格式
+                    # 添加成功安装线条 - 带填充区域
+                    fig_weekly.add_trace(
+                        go.Scatter(
+                            x=weekly_df['week'],
+                            y=weekly_df['successful'],
+                            name='成功安装',
+                            line=dict(width=3, color='#4CAF50'),
+                            mode='lines+markers',
+                            marker=dict(size=8, color='#4CAF50', line=dict(width=1, color='white')),
+                            fill='tozeroy',
+                            fillcolor='rgba(76, 175, 80, 0.2)'
+                        )
+                    )
+                    
+                    # 添加成功率线条，仿照月趋势图
+                    fig_weekly.add_trace(
+                        go.Scatter(
+                            x=weekly_df['week'],
+                            y=weekly_df['success_rate'],
+                            name='成功率 (%)',
+                            line=dict(width=3, color='#FF9800', dash='dot'),
+                            mode='lines+markers',
+                            marker=dict(size=7, color='#FF9800'),
+                            yaxis='y2'
+                        )
+                    )
+                    
+                    # 美化图表，添加双Y轴
                     fig_weekly.update_layout(
-                        height=450,
                         xaxis_title='周起始日期',
                         yaxis_title='安装数量',
-                        bargap=0.4,  # 调整柱间距
+                        height=450,
+                        hovermode='x unified',
                         plot_bgcolor='white',
                         paper_bgcolor='white',
                         xaxis=dict(
                             showgrid=True,
                             gridcolor='rgba(211, 211, 211, 0.5)',
                             zeroline=False,
-                            tickangle=45  # 倾斜日期标签
+                            tickangle=45
                         ),
                         yaxis=dict(
                             showgrid=True,
                             gridcolor='rgba(211, 211, 211, 0.5)',
-                            zeroline=False
+                            zeroline=False,
+                            title='安装数量'
                         ),
-                        margin=dict(l=10, r=10, b=10, t=50),
+                        yaxis2=dict(
+                            title='成功率 (%)',
+                            overlaying='y',
+                            side='right',
+                            range=[0, 100],
+                            ticksuffix='%'
+                        ),
+                        margin=dict(l=10, r=50, b=10, t=50),
                         legend=dict(
-                            orientation="v",
+                            orientation="h",
                             xanchor="right",
-                            x=0.99,
+                            x=1.0,
                             yanchor="top",
-                            y=0.99,
-                            bgcolor="rgba(255,255,255,0.8)",
-                            bordercolor="rgba(211,211,211,0.5)",
-                            borderwidth=1
+                            y=1.0
                         ),
-                        title_text='每周安装总量',  # 使用title_text代替嵌套字典
+                        title_text='每周安装量与成功率',
                         title_y=0.95,
                         title_x=0.5,
                         title_xanchor='center',
-                        title_yanchor='top',
+                        title_yanchor='top'
                     )
                     
                     st.plotly_chart(fig_weekly, use_container_width=True)
                 else:
                     st.info("暂无每周安装数据")
             
-            # 月趋势图 - 优化样式
+            # 处理月趋势数据
             with trend_tab3:
-                if 'daily_installs' in trend_data and trend_data['daily_installs']:
-                    # 按月聚合数据
-                    trend_df = pd.DataFrame(trend_data['daily_installs'])
-                    trend_df['date'] = pd.to_datetime(trend_df['date'])
-                    trend_df['month'] = trend_df['date'].dt.to_period('M')
+                if 'monthly_installs' in trend_data and trend_data['monthly_installs']:
+                    monthly_df = pd.DataFrame(trend_data['monthly_installs'])
+                    monthly_df['month'] = pd.to_datetime(monthly_df['month'])
                     
-                    # 按月分组
-                    monthly_data = trend_df.groupby('month')['count'].sum().reset_index()
-                    monthly_data['month_date'] = monthly_data['month'].dt.to_timestamp()
+                    # 创建月趋势图 - 改为折线图带填充
+                    fig_monthly = go.Figure()
                     
-                    # 创建月趋势图 - 更吸引人的渐变色柱状图
-                    fig_monthly = px.bar(
-                        monthly_data,
-                        x='month_date',
-                        y='count',
-                        title='每月安装总量',
-                        labels={'month_date': '月份', 'count': '安装数量'},
-                        text='count',  # 显示数值
-                        color='count',  # 根据值设置颜色
-                        color_continuous_scale='Viridis',  # 使用渐变色
+                    # 添加总安装量线条 - 带填充区域
+                    fig_monthly.add_trace(
+                        go.Scatter(
+                            x=monthly_df['month'],
+                            y=monthly_df['total'],
+                            name='总安装量',
+                            line=dict(width=3, color='#1E88E5'),
+                            mode='lines+markers+text',
+                            marker=dict(size=10, color='#1E88E5', line=dict(width=1, color='white')),
+                            text=monthly_df['total'],
+                            textposition='top center',
+                            fill='tozeroy',
+                            fillcolor='rgba(30, 136, 229, 0.2)'
+                        )
                     )
                     
-                    # 美化图表
-                    fig_monthly.update_traces(
-                        texttemplate='%{text}',
-                        textposition='outside',
-                        marker_line_width=1,
-                        marker_line_color='white',  # 白色柱状图边框
-                        hovertemplate='<b>月份</b>: %{x|%Y-%m}<br><b>安装数量</b>: %{y}<extra></extra>'
+                    # 添加成功安装线条 - 带填充区域
+                    fig_monthly.add_trace(
+                        go.Scatter(
+                            x=monthly_df['month'],
+                            y=monthly_df['successful'],
+                            name='成功安装',
+                            line=dict(width=3, color='#4CAF50'),
+                            mode='lines+markers+text',
+                            marker=dict(size=10, color='#4CAF50', line=dict(width=1, color='white')),
+                            text=monthly_df['successful'],
+                            textposition='bottom center',
+                            fill='tozeroy',
+                            fillcolor='rgba(76, 175, 80, 0.2)'
+                        )
                     )
                     
-                    # 添加均值基准线
-                    mean_value = monthly_data['count'].mean()
-                    fig_monthly.add_shape(
-                        type="line",
-                        x0=monthly_data['month_date'].min(),
-                        y0=mean_value,
-                        x1=monthly_data['month_date'].max(),
-                        y1=mean_value,
-                        line=dict(
-                            color="rgba(255, 0, 0, 0.5)",
-                            width=2,
-                            dash="dash",
-                        ),
+                    # 添加成功率线条
+                    fig_monthly.add_trace(
+                        go.Scatter(
+                            x=monthly_df['month'],
+                            y=monthly_df['success_rate'],
+                            name='成功率 (%)',
+                            line=dict(width=3, color='#FF9800', dash='dot'),
+                            mode='lines+markers',
+                            marker=dict(size=8, color='#FF9800'),
+                            yaxis='y2'
+                        )
                     )
                     
-                    # 标记均值
-                    fig_monthly.add_annotation(
-                        x=monthly_data['month_date'].max(),
-                        y=mean_value,
-                        text=f"平均: {mean_value:.1f}",
-                        showarrow=True,
-                        arrowhead=2,
-                        arrowsize=1,
-                        arrowwidth=2,
-                        arrowcolor="rgba(255, 0, 0, 0.5)",
-                        ax=50,
-                        ay=-30
-                    )
-                    
-                    # 增强布局样式 - 使用与日趋势图相同的参数格式
+                    # 美化图表 - 添加双Y轴
                     fig_monthly.update_layout(
-                        height=450,
                         xaxis_title='月份',
                         yaxis_title='安装数量',
+                        height=450,
+                        hovermode='x unified',
                         plot_bgcolor='white',
                         paper_bgcolor='white',
                         xaxis=dict(
-                            tickformat="%Y-%m",
-                            tickangle=45,
                             showgrid=True,
                             gridcolor='rgba(211, 211, 211, 0.5)',
                             zeroline=False,
-                            tickmode='auto',
-                            nticks=len(monthly_data)
+                            tickangle=45,
+                            tickformat="%Y-%m"
                         ),
                         yaxis=dict(
                             showgrid=True,
                             gridcolor='rgba(211, 211, 211, 0.5)',
-                            zeroline=False
+                            zeroline=False,
+                            title='安装数量'
                         ),
-                        margin=dict(l=10, r=10, b=10, t=50),
-                        coloraxis_showscale=False,  # 隐藏颜色刻度
+                        yaxis2=dict(
+                            title='成功率 (%)',
+                            overlaying='y',
+                            side='right',
+                            range=[0, 100],
+                            ticksuffix='%'
+                        ),
+                        margin=dict(l=10, r=50, b=10, t=50),
                         legend=dict(
-                            orientation="v",
+                            orientation="h",
                             xanchor="right",
-                            x=0.99,
+                            x=1.0,
                             yanchor="top",
-                            y=0.99,
-                            bgcolor="rgba(255,255,255,0.8)",
-                            bordercolor="rgba(211,211,211,0.5)",
-                            borderwidth=1
+                            y=1.0
                         ),
-                        title_text='每月安装总量',  # 使用title_text代替嵌套字典
+                        title_text='每月安装量与成功率',
                         title_y=0.95,
                         title_x=0.5,
                         title_xanchor='center',
-                        title_yanchor='top',
+                        title_yanchor='top'
                     )
                     
                     st.plotly_chart(fig_monthly, use_container_width=True)
                 else:
                     st.info("暂无每月安装数据")
-
-    
-
-        # 创建步骤成功率图表
-        st.subheader("安装步骤状态分布")
-        
-        steps_data = []
-        available_steps = []
-        
-        for step, statuses in stats["steps_status"].items():
-            available_steps.append(step)
-            total = sum(statuses.values())
-            for status, count in statuses.items():
-                steps_data.append({
-                    "步骤": step,
-                    "状态": status,
-                    "数量": count,
-                    "百分比": (count / total * 100) if total > 0 else 0
-                })
-        
-        # 添加步骤筛选到侧边栏
-        step_filter = st.sidebar.multiselect(
-            "安装步骤过滤",
-            options=["全部"] + available_steps,
-            default=["全部"]
-        )
-        
-        steps_df = pd.DataFrame(steps_data)
-        
-        # 应用步骤筛选
-        if step_filter and "全部" not in step_filter:
-            steps_df = steps_df[steps_df["步骤"].isin(step_filter)]
-        
-        if not steps_df.empty:
-            fig = px.bar(
-                steps_df,
-                x="步骤",
-                y="数量",
-                color="状态",
-                barmode="stack",
-                text="百分比",
-                hover_data=["步骤", "状态", "数量", "百分比"],
-                labels={"百分比": "%"}
-            )
-            fig.update_layout(height=500)
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("暂无步骤数据")
     else:
         st.warning("无法获取统计数据。请确保后端API正在运行。")
         if st.button("尝试重新连接"):

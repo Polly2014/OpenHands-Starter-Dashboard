@@ -61,25 +61,60 @@ async def receive_telemetry(event: Dict[str, Any]):
         )
 
 @router.get("/stats", response_model=TelemetryStats)
-async def get_telemetry_stats():
-    """获取遥测数据统计摘要"""
+async def get_telemetry_stats(start_date: str = None):
+    """获取遥测数据统计摘要，支持日期过滤"""
     try:
-        # 获取会话总数
-        total_sessions = len(await telemetry_collection.distinct("sessionId"))
+        # 处理起始日期过滤
+        query = {}
+        if start_date:
+            try:
+                start = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
+                query["timestamp"] = {"$gte": start}
+            except (ValueError, TypeError):
+                pass
         
-        # 获取成功安装数 - 修改规则为 step=deploy, status=success
-        completed_installs = await telemetry_collection.count_documents({
-            "step": "deploy",
-            "status": "success"
-        })
+        # 获取会话总数 - 基于所有唯一的会话ID
+        sessions_pipeline = [
+            {"$match": query}, # 移除对步骤的限制，获取所有记录
+            {"$group": {
+                "_id": "$sessionId" # 按会话ID分组
+            }},
+            {"$count": "total"} # 计数
+        ]
+        
+        sessions_result = await telemetry_collection.aggregate(sessions_pipeline).to_list(None)
+        total_sessions = sessions_result[0]["total"] if sessions_result else 0
+        
+        # 获取成功安装数 - 应用日期过滤
+        successful_sessions_pipeline = [
+            {"$match": {
+                "step": "deploy",
+                "status": "success",
+                **query
+            }},
+            {"$group": {
+                "_id": "$sessionId" # 确保每个会话只统计一次
+            }},
+            {"$count": "total"}
+        ]
+        
+        successful_result = await telemetry_collection.aggregate(successful_sessions_pipeline).to_list(None)
+        completed_installs = successful_result[0]["total"] if successful_result else 0
         
         # 计算成功率
         success_rate = (completed_installs / total_sessions * 100) if total_sessions > 0 else 0
         
         # 获取按操作系统划分的安装数
         os_pipeline = [
+            {"$match": query},
             {"$group": {
-                "_id": "$osName",
+                "_id": {
+                    "sessionId": "$sessionId", 
+                    "osName": "$osName"
+                }
+            }},
+            {"$group": {
+                "_id": "$_id.osName",
                 "count": {"$sum": 1}
             }},
             {"$match": {"_id": {"$ne": None}}}
@@ -90,6 +125,7 @@ async def get_telemetry_stats():
         
         # 获取按步骤划分的状态统计
         steps_pipeline = [
+            {"$match": query},
             {"$group": {
                 "_id": {"step": "$step", "status": "$status"},
                 "count": {"$sum": 1}
@@ -111,12 +147,7 @@ async def get_telemetry_stats():
         
         # 计算平均安装时间
         time_pipeline = [
-            {"$match": {
-                "$or": [
-                    {"step": "install"},  # 保留 install 步骤用于计算安装时间
-                    {"step": "deploy"}    # 添加 deploy 步骤用于计算安装时间
-                ]
-            }},
+            {"$match": query},
             {"$group": {
                 "_id": "$sessionId",
                 "minTime": {"$min": "$timestamp"},
@@ -200,7 +231,7 @@ async def get_anomalies():
 
 @router.get("/trends")
 async def get_installation_trends(start_date: str = None):
-    """获取安装趋势数据，包括每日和每周安装量"""
+    """获取安装趋势数据，包括每日、每周和每月安装量"""
     try:
         # 处理起始日期过滤
         query = {}
@@ -211,112 +242,281 @@ async def get_installation_trends(start_date: str = None):
             except (ValueError, TypeError):
                 pass
         
-        # 按天统计安装数量 - 修改成功条件为 step=deploy, status=success
-        daily_pipeline = [
-            {"$match": {
-                "$or": [
-                    {"step": "install"},  # 保留 install 步骤用于计算总安装量
-                    {"step": "deploy"}    # 添加 deploy 步骤用于计算成功安装
-                ],
-                **query
+        # 按天统计安装数量 - 修改为分开计算总安装和成功安装
+        # 1. 首先统计所有唯一会话ID（总安装数）
+        daily_sessions_pipeline = [
+            {"$match": query},
+            {"$sort": {"timestamp": 1}},
+            {"$group": {
+                "_id": {
+                    "sessionId": "$sessionId",
+                    "year": {"$year": "$timestamp"},
+                    "month": {"$month": "$timestamp"},
+                    "day": {"$dayOfMonth": "$timestamp"}
+                },
+                "timestamp": {"$first": "$timestamp"}
             }},
             {"$group": {
                 "_id": {
-                    "year": {"$year": "$timestamp"},
-                    "month": {"$month": "$timestamp"},
-                    "day": {"$dayOfMonth": "$timestamp"},
-                    "success": {"$cond": [
-                        {"$and": [
-                            {"$eq": ["$step", "deploy"]},
-                            {"$eq": ["$status", "success"]}
-                        ]},
-                        True,
-                        False
-                    ]}
+                    "year": "$_id.year",
+                    "month": "$_id.month",
+                    "day": "$_id.day"
                 },
-                "count": {"$sum": 1}
-            }},
-            {"$project": {
-                "_id": 0,
-                "date": {
+                "total": {"$sum": 1},
+                "date": {"$first": {
                     "$dateFromParts": {
                         "year": "$_id.year",
                         "month": "$_id.month",
                         "day": "$_id.day"
                     }
-                },
-                "success": "$_id.success",
-                "count": 1
+                }}
+            }},
+            {"$project": {
+                "_id": 0,
+                "date": 1,
+                "total": 1
             }},
             {"$sort": {"date": 1}}
         ]
         
-        daily_results = await telemetry_collection.aggregate(daily_pipeline).to_list(None)
-        
-        # 重新组织日期数据，计算每天的总安装数和成功率
-        daily_data = {}
-        for item in daily_results:
-            date_str = item["date"].strftime("%Y-%m-%d")
-            if date_str not in daily_data:
-                daily_data[date_str] = {"date": date_str, "count": 0, "successful": 0}
-            
-            daily_data[date_str]["count"] += item["count"]
-            if item["success"]:
-                daily_data[date_str]["successful"] += item["count"]
-        
-        # 计算成功率
-        daily_installs = []
-        for date_str, data in daily_data.items():
-            if data["count"] > 0:
-                data["success_rate"] = (data["successful"] / data["count"]) * 100
-            else:
-                data["success_rate"] = 0
-            daily_installs.append(data)
-        
-        # 按周统计安装数量（每周的开始日期为周一）
-        weekly_pipeline = [
-            {"$match": {"step": "install", **query}},
+        # 2. 然后统计成功会话数（部署成功的会话）
+        daily_success_pipeline = [
+            {"$match": {
+                "step": "deploy",
+                "status": "success",
+                **query
+            }},
+            {"$sort": {"timestamp": 1}},
             {"$group": {
                 "_id": {
+                    "sessionId": "$sessionId",
                     "year": {"$year": "$timestamp"},
-                    "week": {"$week": "$timestamp"}
+                    "month": {"$month": "$timestamp"},
+                    "day": {"$dayOfMonth": "$timestamp"}
                 },
-                "count": {"$sum": 1},
-                "firstDay": {"$min": "$timestamp"}
+                "timestamp": {"$first": "$timestamp"}
+            }},
+            {"$group": {
+                "_id": {
+                    "year": "$_id.year",
+                    "month": "$_id.month",
+                    "day": "$_id.day"
+                },
+                "successful": {"$sum": 1},
+                "date": {"$first": {
+                    "$dateFromParts": {
+                        "year": "$_id.year",
+                        "month": "$_id.month",
+                        "day": "$_id.day"
+                    }
+                }}
             }},
             {"$project": {
                 "_id": 0,
-                "week_start": "$firstDay",
-                "year": "$_id.year",
-                "week": "$_id.week",
-                "count": 1
+                "date": 1,
+                "successful": 1
             }},
-            {"$sort": {"year": 1, "week": 1}}
+            {"$sort": {"date": 1}}
         ]
         
-        weekly_results = await telemetry_collection.aggregate(weekly_pipeline).to_list(None)
+        # 执行查询获取结果
+        daily_sessions_result = await telemetry_collection.aggregate(daily_sessions_pipeline).to_list(None)
+        daily_success_result = await telemetry_collection.aggregate(daily_success_pipeline).to_list(None)
         
-        # 确保每周的开始日期是周一
-        weekly_installs = []
-        for item in weekly_results:
+        # 合并结果到一个字典
+        daily_data = {}
+        for item in daily_sessions_result:
+            date_str = item["date"].strftime("%Y-%m-%d")
+            daily_data[date_str] = {"date": date_str, "total": item["total"], "successful": 0}
+        
+        for item in daily_success_result:
+            date_str = item["date"].strftime("%Y-%m-%d")
+            if date_str in daily_data:
+                daily_data[date_str]["successful"] = item["successful"]
+            else:
+                # 这种情况不应该发生，但为了健壮性添加
+                daily_data[date_str] = {"date": date_str, "total": 0, "successful": item["successful"]}
+        
+        # 计算成功率并整理数据
+        daily_installs = []
+        for date_str, data in daily_data.items():
+            success_rate = 0
+            if data["total"] > 0:
+                success_rate = (data["successful"] / data["total"]) * 100
+            
+            daily_installs.append({
+                "date": date_str,
+                "total": data["total"],
+                "successful": data["successful"],
+                "success_rate": success_rate
+            })
+        
+        # 按日期排序
+        daily_installs.sort(key=lambda x: x["date"])
+        
+        # 使用相同的方法修复周统计
+        # 1. 总安装数（所有唯一会话）
+        weekly_sessions_pipeline = [
+            {"$match": query},
+            {"$sort": {"timestamp": 1}},
+            {"$group": {
+                "_id": {
+                    "sessionId": "$sessionId",
+                    "year": {"$year": "$timestamp"},
+                    "week": {"$week": "$timestamp"}
+                },
+                "timestamp": {"$first": "$timestamp"},
+                "firstDay": {"$first": "$timestamp"}
+            }},
+            {"$group": {
+                "_id": {
+                    "year": "$_id.year",
+                    "week": "$_id.week"
+                },
+                "total": {"$sum": 1},
+                "week_start": {"$min": "$firstDay"}
+            }},
+            {"$sort": {"_id.year": 1, "_id.week": 1}}
+        ]
+        
+        # 2. 成功安装数
+        weekly_success_pipeline = [
+            {"$match": {
+                "step": "deploy",
+                "status": "success",
+                **query
+            }},
+            {"$sort": {"timestamp": 1}},
+            {"$group": {
+                "_id": {
+                    "sessionId": "$sessionId",
+                    "year": {"$year": "$timestamp"},
+                    "week": {"$week": "$timestamp"}
+                },
+                "timestamp": {"$first": "$timestamp"},
+                "firstDay": {"$first": "$timestamp"}
+            }},
+            {"$group": {
+                "_id": {
+                    "year": "$_id.year",
+                    "week": "$_id.week"
+                },
+                "successful": {"$sum": 1},
+                "week_start": {"$min": "$firstDay"}
+            }},
+            {"$sort": {"_id.year": 1, "_id.week": 1}}
+        ]
+        
+        weekly_sessions_result = await telemetry_collection.aggregate(weekly_sessions_pipeline).to_list(None)
+        weekly_success_result = await telemetry_collection.aggregate(weekly_success_pipeline).to_list(None)
+        
+        # 合并周数据
+        weekly_data = {}
+        for item in weekly_sessions_result:
             # 获取周开始日期（周一）
             week_start = item["week_start"]
-            # 调整到当周的周一
             while week_start.weekday() != 0:  # 0代表周一
                 week_start = week_start - timedelta(days=1)
             
-            weekly_installs.append({
-                "week_start": week_start.strftime("%Y-%m-%d"),
-                "count": item["count"]
-            })
+            week_key = week_start.strftime("%Y-%m-%d")
+            weekly_data[week_key] = {"week_start": week_key, "total": item["total"], "successful": 0}
         
+        for item in weekly_success_result:
+            # 获取周开始日期（周一）
+            week_start = item["week_start"]
+            while week_start.weekday() != 0:  # 0代表周一
+                week_start = week_start - timedelta(days=1)
+            
+            week_key = week_start.strftime("%Y-%m-%d")
+            if week_key in weekly_data:
+                weekly_data[week_key]["successful"] = item["successful"]
+            else:
+                weekly_data[week_key] = {"week_start": week_key, "total": 0, "successful": item["successful"]}
+        
+        # 计算每周成功率
+        weekly_installs = []
+        for week_key, data in weekly_data.items():
+            success_rate = 0
+            if data["total"] > 0:
+                success_rate = (data["successful"] / data["total"]) * 100
+            
+            weekly_installs.append({
+                "week_start": week_key,
+                "total": data["total"],
+                "successful": data["successful"],
+                "success_rate": success_rate
+            })
+            
+        # 排序结果
+        weekly_installs.sort(key=lambda x: x["week_start"])
+        
+        # 计算月度数据 - 从日数据中按月聚合
+        monthly_data = {}
+        
+        # 从日数据中按月聚合
+        for item in daily_installs:
+            date = datetime.strptime(item["date"], "%Y-%m-%d")
+            month_key = date.strftime("%Y-%m-01")  # 使用月的第一天作为键
+            
+            if month_key not in monthly_data:
+                monthly_data[month_key] = {"month": month_key, "total": 0, "successful": 0}
+            
+            monthly_data[month_key]["total"] += item["total"]
+            monthly_data[month_key]["successful"] += item["successful"]
+        
+        # 生成月度数据列表
+        monthly_installs = []
+        for month_key, data in monthly_data.items():
+            success_rate = 0
+            if data["total"] > 0:
+                success_rate = (data["successful"] / data["total"]) * 100
+                
+            monthly_installs.append({
+                "month": month_key,
+                "total": data["total"],
+                "successful": data["successful"],
+                "success_rate": success_rate
+            })
+            
+        # 排序月度数据
+        monthly_installs.sort(key=lambda x: x["month"])
+        
+        # 获取今日、本周、本月的安装数据
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        this_week_start = (datetime.utcnow() - timedelta(days=datetime.utcnow().weekday())).strftime("%Y-%m-%d")
+        this_month = datetime.utcnow().strftime("%Y-%m-01")
+        
+        today_data = next((item for item in daily_installs if item["date"] == today), {"total": 0, "successful": 0})
+        this_week_data = next((item for item in weekly_installs if item["week_start"] == this_week_start), {"total": 0, "successful": 0})
+        this_month_data = next((item for item in monthly_installs if item["month"] == this_month), {"total": 0, "successful": 0})
+        
+        # 汇总数据
+        summary = {
+            "today": {
+                "total": today_data["total"],
+                "successful": today_data["successful"]
+            },
+            "this_week": {
+                "total": this_week_data["total"],
+                "successful": this_week_data["successful"]
+            },
+            "this_month": {
+                "total": this_month_data["total"],
+                "successful": this_month_data["successful"]
+            }
+        }
+            
         return {
             "daily_installs": daily_installs,
-            "weekly_installs": weekly_installs
+            "weekly_installs": weekly_installs,
+            "monthly_installs": monthly_installs,
+            "summary": summary
         }
     
     except Exception as e:
         logger.error(f"Error generating installation trends: {str(e)}")
+        import traceback
+        logger.error(f"Exception traceback: {traceback.format_exc()}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to generate installation trends: {str(e)}"
