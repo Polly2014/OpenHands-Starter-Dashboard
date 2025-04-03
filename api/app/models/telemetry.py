@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field
 
 class TelemetryEvent(BaseModel):
     anonymousId: str
+    username: str
     sessionId: str
     step: str
     status: str

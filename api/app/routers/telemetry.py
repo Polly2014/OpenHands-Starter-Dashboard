@@ -19,6 +19,7 @@ async def receive_telemetry(event: Dict[str, Any]):
         telemetry_data = {
             "anonymousId": event.get("anonymousId"),
             "sessionId": event.get("sessionId"),
+            "username": event.get("username"),
             "step": event.get("step"),
             "status": event.get("status"),
             "scriptVersion": event.get("scriptVersion"),
@@ -543,3 +544,502 @@ async def debug_session(session_id: str):
     
     except Exception as e:
         return {"error": str(e)}
+
+@router.get("/users/overview")
+async def get_users_overview(start_date: str = None):
+    """
+    获取用户概览数据，包括用户总数、活跃度指标和版本分布情况，包含匿名用户
+    """
+    try:
+        # 处理起始日期过滤
+        query = {}
+        if start_date:
+            try:
+                start = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
+                query["timestamp"] = {"$gte": start}
+            except (ValueError, TypeError):
+                pass
+        
+        # 获取所有会话ID（包括匿名和有用户名的）
+        all_sessions = await telemetry_collection.distinct("sessionId", query)
+        total_sessions = len(all_sessions)
+        
+        # 获取用户名（非空的）
+        named_users = await telemetry_collection.distinct("username", {
+            "username": {"$exists": True, "$ne": None},
+            **query
+        })
+        named_users_count = len(named_users)
+        
+        # 估算匿名用户数量 - 获取没有username但有anonymousId的记录
+        anonymous_users_pipeline = [
+            {"$match": {
+                "$or": [
+                    {"username": {"$exists": False}},
+                    {"username": None}
+                ],
+                "anonymousId": {"$exists": True, "$ne": None},
+                **query
+            }},
+            {"$group": {
+                "_id": "$anonymousId"
+            }},
+            {"$count": "count"}
+        ]
+        
+        anonymous_result = await telemetry_collection.aggregate(anonymous_users_pipeline).to_list(None)
+        anonymous_count = anonymous_result[0]["count"] if anonymous_result else 0
+        
+        total_users = named_users_count + anonymous_count
+        
+        # 获取活跃用户数（过去30天有活动的用户，包括匿名用户）
+        now = datetime.utcnow()
+        thirty_days_ago = now - timedelta(days=30)
+        
+        active_users_pipeline = [
+            {"$match": {
+                "timestamp": {"$gte": thirty_days_ago},
+                **query
+            }},
+            {"$group": {
+                "_id": {
+                    "$cond": [
+                        {"$and": [
+                            {"$eq": [{"$ifNull": ["$username", None]}, None]}
+                        ]},
+                        "$anonymousId",  # 如果没有username，就用anonymousId
+                        "$username"      # 否则使用username
+                    ]
+                }
+            }},
+            {"$count": "active_count"}
+        ]
+        
+        active_users_result = await telemetry_collection.aggregate(active_users_pipeline).to_list(None)
+        active_users = active_users_result[0]["active_count"] if active_users_result else 0
+        
+        # 计算新用户（过去30天首次出现的用户）- 修复：添加此部分
+        new_users_pipeline = [
+            {"$match": {
+                "timestamp": {"$gte": thirty_days_ago},
+                **query
+            }},
+            {"$sort": {"timestamp": 1}},
+            {"$group": {
+                "_id": {
+                    "$cond": [
+                        {"$and": [
+                            {"$eq": [{"$ifNull": ["$username", None]}, None]}
+                        ]},
+                        "$anonymousId",  # 如果没有username，就用anonymousId
+                        "$username"      # 否则使用username
+                    ]
+                },
+                "firstSeen": {"$first": "$timestamp"}
+            }},
+            {"$match": {
+                "firstSeen": {"$gte": thirty_days_ago}
+            }},
+            {"$count": "new_user_count"}
+        ]
+        
+        new_users_result = await telemetry_collection.aggregate(new_users_pipeline).to_list(None)
+        new_users = new_users_result[0]["new_user_count"] if new_users_result else 0
+        
+        # 获取每月新用户趋势 - 修复：添加此部分
+        monthly_new_users_pipeline = [
+            {"$match": query},
+            {"$sort": {"timestamp": 1}},
+            {"$group": {
+                "_id": {
+                    "$cond": [
+                        {"$and": [
+                            {"$eq": [{"$ifNull": ["$username", None]}, None]}
+                        ]},
+                        "$anonymousId",  # 如果没有username，就用anonymousId
+                        "$username"      # 否则使用username
+                    ]
+                },
+                "firstSeen": {"$first": "$timestamp"}
+            }},
+            {"$project": {
+                "year": {"$year": "$firstSeen"},
+                "month": {"$month": "$firstSeen"}
+            }},
+            {"$group": {
+                "_id": {
+                    "year": "$year",
+                    "month": "$month"
+                },
+                "count": {"$sum": 1}
+            }},
+            {"$sort": {"_id.year": 1, "_id.month": 1}}
+        ]
+        
+        monthly_new_users = await telemetry_collection.aggregate(monthly_new_users_pipeline).to_list(None)
+        
+        # 格式化月份数据 - 修复：添加此部分
+        new_users_trend = []
+        for item in monthly_new_users:
+            year = item["_id"]["year"]
+            month = item["_id"]["month"]
+            # 创建月份的第一天作为日期标识
+            date_str = datetime(year, month, 1).strftime("%Y-%m-%d")
+            new_users_trend.append({
+                "date": date_str,
+                "count": item["count"],
+                "month_name": calendar.month_name[month]
+            })
+        
+        # 获取版本分布情况 - 包括匿名用户
+        version_users_pipeline = [
+            {"$match": {
+                "scriptVersion": {"$exists": True},
+                **query
+            }},
+            {"$sort": {"timestamp": 1}},
+            {"$group": {
+                "_id": {
+                    "$cond": [
+                        {"$and": [
+                            {"$eq": [{"$ifNull": ["$username", None]}, None]}
+                        ]},
+                        "$anonymousId",  # 如果没有username，就用anonymousId
+                        "$username"      # 否则使用username
+                    ]
+                },
+                "latestVersion": {"$last": "$scriptVersion"},
+                "lastSeen": {"$last": "$timestamp"},
+                "isAnonymous": {"$last": {"$cond": [
+                    {"$and": [
+                        {"$eq": [{"$ifNull": ["$username", None]}, None]}
+                    ]},
+                    True,
+                    False
+                ]}}
+            }},
+            {"$group": {
+                "_id": {"$ifNull": ["$latestVersion", "未知版本"]},
+                "userCount": {"$sum": 1},
+                "anonymousCount": {"$sum": {"$cond": ["$isAnonymous", 1, 0]}},
+                "namedCount": {"$sum": {"$cond": ["$isAnonymous", 0, 1]}},
+                "users": {"$push": {
+                    "id": "$_id", 
+                    "lastSeen": "$lastSeen",
+                    "isAnonymous": "$isAnonymous"
+                }}
+            }},
+            {"$project": {
+                "userCount": 1,
+                "anonymousCount": 1,
+                "namedCount": 1,
+                "activeUsers": {
+                    "$size": {
+                        "$filter": {
+                            "input": "$users",
+                            "as": "user",
+                            "cond": {"$gte": ["$$user.lastSeen", thirty_days_ago]}
+                        }
+                    }
+                }
+            }},
+            {"$sort": {"userCount": -1}}
+        ]
+        
+        version_users = await telemetry_collection.aggregate(version_users_pipeline).to_list(None)
+        version_distribution = []
+        
+        for item in version_users:
+            version = str(item["_id"]) if item["_id"] is not None else "未知版本"
+            version_distribution.append({
+                "version": version,
+                "userCount": item["userCount"],
+                "anonymousCount": item["anonymousCount"],
+                "namedCount": item["namedCount"],
+                "activeUsers": item["activeUsers"],
+                "activePercentage": round((item["activeUsers"] / item["userCount"]) * 100, 1) if item["userCount"] > 0 else 0
+            })
+            
+        # 获取版本采用趋势（按月），包括匿名用户 - 修复：更新查询以包括匿名用户
+        version_trend_pipeline = [
+            {"$match": {
+                "scriptVersion": {"$exists": True, "$ne": None},
+                **query
+            }},
+            {"$sort": {"timestamp": 1}},
+            {"$group": {
+                "_id": {
+                    "$cond": [
+                        {"$and": [
+                            {"$eq": [{"$ifNull": ["$username", None]}, None]}
+                        ]},
+                        "$anonymousId",  # 如果没有username，就用anonymousId
+                        "$username"      # 否则使用username
+                    ]
+                },
+                "firstVersion": {"$first": "$scriptVersion"},
+                "firstSeen": {"$first": "$timestamp"},
+                "year": {"$first": {"$year": "$timestamp"}},
+                "month": {"$first": {"$month": "$timestamp"}}
+            }},
+            {"$group": {
+                "_id": {
+                    "year": "$year",
+                    "month": "$month",
+                    "version": "$firstVersion"
+                },
+                "count": {"$sum": 1}
+            }},
+            {"$sort": {"_id.year": 1, "_id.month": 1}}
+        ]
+        
+        version_trend = await telemetry_collection.aggregate(version_trend_pipeline).to_list(None)
+        
+        # 格式化版本趋势数据
+        version_adoption_trend = []
+        for item in version_trend:
+            year = item["_id"]["year"]
+            month = item["_id"]["month"]
+            version = str(item["_id"]["version"]) 
+            date_str = datetime(year, month, 1).strftime("%Y-%m-%d")
+            version_adoption_trend.append({
+                "date": date_str,
+                "version": version,
+                "count": item["count"],
+                "month_name": calendar.month_name[month]
+            })
+        
+        # 获取最活跃的用户列表（top N），包括匿名用户 - 修复：更新查询以包括匿名用户
+        top_users_pipeline = [
+            {"$match": query}, # 移除username过滤以包含所有类型用户
+            {"$group": {
+                "_id": {
+                    "$cond": [
+                        {"$and": [
+                            {"$eq": [{"$ifNull": ["$username", None]}, None]}
+                        ]},
+                        "$anonymousId",  # 如果没有username，就用anonymousId
+                        "$username"      # 否则使用username
+                    ]
+                },
+                "isAnonymous": {"$last": {"$cond": [
+                    {"$and": [
+                        {"$eq": [{"$ifNull": ["$username", None]}, None]}
+                    ]},
+                    True,
+                    False
+                ]}},
+                "installCount": {"$sum": {"$cond": [{"$eq": ["$step", "install"]}, 1, 0]}},
+                "deployCount": {"$sum": {"$cond": [{"$eq": ["$step", "deploy"]}, 1, 0]}},
+                "successCount": {"$sum": {"$cond": [
+                    {"$and": [{"$eq": ["$step", "deploy"]}, {"$eq": ["$status", "success"]}]}, 
+                    1, 0
+                ]}},
+                "lastSeen": {"$max": "$timestamp"},
+                "latestVersion": {"$last": "$scriptVersion"}
+            }},
+            {"$sort": {"successCount": -1, "installCount": -1}},
+            {"$limit": 10}
+        ]
+        
+        top_users_result = await telemetry_collection.aggregate(top_users_pipeline).to_list(None)
+        top_users = []
+        
+        for user in top_users_result:
+            user_id = user["_id"]
+            # 匿名用户显示为"anonymous_"+前8位ID
+            display_name = user_id if not user["isAnonymous"] else f"匿名用户_{user_id[:8] if user_id else 'unknown'}"
+            
+            top_users.append({
+                "username": display_name,
+                "isAnonymous": user["isAnonymous"],
+                "installCount": user["installCount"],
+                "deployCount": user["deployCount"],
+                "successCount": user["successCount"],
+                "lastSeen": user["lastSeen"],
+                "latestVersion": user["latestVersion"] if user["latestVersion"] else "未知版本",
+                "isActive": (now - user["lastSeen"]).total_seconds() < (30 * 24 * 60 * 60)  # 30天内活跃
+            })
+            
+        return {
+            "total_users": total_users,
+            "named_users": named_users_count, 
+            "anonymous_users": anonymous_count,
+            "active_users": active_users,
+            "inactive_users": total_users - active_users,
+            "new_users_30d": new_users,  # 修复：现在有定义了
+            "new_users_trend": new_users_trend,  # 修复：现在有定义了
+            "version_distribution": version_distribution,
+            "version_adoption_trend": version_adoption_trend,
+            "top_users": top_users
+        }
+    
+    except Exception as e:
+        logger.error(f"Error generating user overview: {str(e)}")
+        # 添加更多详细的错误日志，帮助调试
+        import traceback
+        logger.error(f"Exception traceback: {traceback.format_exc()}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to generate user overview: {str(e)}"
+        )
+
+@router.get("/users/{username}")
+async def get_user_details(username: str, start_date: str = None):
+    """
+    获取指定用户的详细信息
+    """
+    try:
+        # 处理起始日期过滤
+        query = {"username": username}
+        if start_date:
+            try:
+                start = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
+                query["timestamp"] = {"$gte": start}
+            except (ValueError, TypeError):
+                pass
+        
+        # 检查用户是否存在
+        user_exists = await telemetry_collection.count_documents({"username": username}) > 0
+        if not user_exists:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"User '{username}' not found"
+            )
+        
+        # 用户基本统计数据
+        user_stats_pipeline = [
+            {"$match": query},
+            {"$group": {
+                "_id": "$username",
+                "installCount": {"$sum": {"$cond": [{"$eq": ["$step", "install"]}, 1, 0]}},
+                "deployCount": {"$sum": {"$cond": [{"$eq": ["$step", "deploy"]}, 1, 0]}},
+                "successCount": {"$sum": {"$cond": [
+                    {"$and": [{"$eq": ["$step", "deploy"]}, {"$eq": ["$status", "success"]}]}, 
+                    1, 0
+                ]}},
+                "firstSeen": {"$min": "$timestamp"},
+                "lastSeen": {"$max": "$timestamp"},
+                "versions": {"$addToSet": "$scriptVersion"},
+                "sessions": {"$addToSet": "$sessionId"}
+            }},
+            {"$project": {
+                "installCount": 1,
+                "deployCount": 1,
+                "successCount": 1,
+                "successRate": {
+                    "$cond": [
+                        {"$gt": ["$deployCount", 0]},
+                        {"$multiply": [{"$divide": ["$successCount", "$deployCount"]}, 100]},
+                        0
+                    ]
+                },
+                "firstSeen": 1,
+                "lastSeen": 1,
+                "daysSinceFirstSeen": {
+                    "$divide": [
+                        {"$subtract": [datetime.utcnow(), "$firstSeen"]},
+                        24 * 60 * 60 * 1000
+                    ]
+                },
+                "daysSinceLastSeen": {
+                    "$divide": [
+                        {"$subtract": [datetime.utcnow(), "$lastSeen"]},
+                        24 * 60 * 60 * 1000
+                    ]
+                },
+                "versions": 1,
+                "versionCount": {"$size": "$versions"},
+                "sessionCount": {"$size": "$sessions"}
+            }}
+        ]
+        
+        user_stats_result = await telemetry_collection.aggregate(user_stats_pipeline).to_list(None)
+        user_stats = user_stats_result[0] if user_stats_result else {}
+        
+        # 获取用户版本历史
+        version_history_pipeline = [
+            {"$match": query},
+            {"$sort": {"timestamp": 1}},
+            {"$group": {
+                "_id": {
+                    "sessionId": "$sessionId", 
+                    "version": "$scriptVersion"
+                },
+                "firstSeen": {"$first": "$timestamp"},
+                "step": {"$first": "$step"},
+                "status": {"$first": "$status"}
+            }},
+            {"$match": {"_id.version": {"$ne": None}}},
+            {"$sort": {"firstSeen": 1}}
+        ]
+        
+        version_history_result = await telemetry_collection.aggregate(version_history_pipeline).to_list(None)
+        version_history = []
+        
+        for entry in version_history_result:
+            version_history.append({
+                "timestamp": entry["firstSeen"],
+                "version": entry["_id"]["version"],
+                "sessionId": entry["_id"]["sessionId"],
+                "step": entry["step"],
+                "status": entry["status"]
+            })
+            
+        # 获取用户最近的会话列表
+        recent_sessions_pipeline = [
+            {"$match": query},
+            {"$sort": {"timestamp": -1}},
+            {"$group": {
+                "_id": "$sessionId",
+                "firstEvent": {"$last": "$timestamp"},
+                "lastEvent": {"$first": "$timestamp"},
+                "scriptVersion": {"$first": "$scriptVersion"}
+            }},
+            {"$project": {
+                "sessionId": "$_id",
+                "firstEvent": 1,
+                "lastEvent": 1,
+                "duration": {"$subtract": ["$lastEvent", "$firstEvent"]},
+                "scriptVersion": 1
+            }},
+            {"$sort": {"lastEvent": -1}},
+            {"$limit": 10}
+        ]
+        
+        recent_sessions_result = await telemetry_collection.aggregate(recent_sessions_pipeline).to_list(None)
+        recent_sessions = []
+        
+        for session in recent_sessions_result:
+            # 查询该会话是否成功
+            success_result = await telemetry_collection.count_documents({
+                "sessionId": session["sessionId"],
+                "step": "deploy",
+                "status": "success"
+            })
+            
+            recent_sessions.append({
+                "sessionId": session["sessionId"],
+                "startTime": session["firstEvent"],
+                "endTime": session["lastEvent"],
+                "duration_seconds": session["duration"] / 1000 if session["duration"] else 0,
+                "version": session["scriptVersion"] or "未知版本",
+                "success": success_result > 0
+            })
+        
+        return {
+            "username": username,
+            "stats": user_stats,
+            "version_history": version_history,
+            "recent_sessions": recent_sessions,
+            "is_active": user_stats.get("daysSinceLastSeen", 999) <= 30 if user_stats else False
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error retrieving user details for {username}: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve user details: {str(e)}"
+        )
