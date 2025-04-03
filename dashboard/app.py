@@ -421,17 +421,6 @@ st.sidebar.header("筛选器")
 date_options = ["最近7天", "最近30天", "最近90天", "全部"]
 date_filter = st.sidebar.selectbox("时间范围", date_options)
 
-# 添加会话状态筛选器
-status_options = ["全部", "成功", "失败"]
-session_status_filter = st.sidebar.multiselect(
-    "会话状态",
-    options=status_options,
-    default=["全部"]
-)
-
-if "全部" in session_status_filter and len(session_status_filter) > 1:
-    # 如果同时选择了"全部"和其他选项，则只保留"全部"
-    session_status_filter = ["全部"]
 
 with tab_installation:
 
@@ -446,20 +435,11 @@ with tab_installation:
 
     # 获取筛选过的日期
     start_date = filter_by_date(date_filter)
-
-    # 获取各种数据
+    
+    # 获取所有数据
     stats = get_telemetry_stats(start_date)
     trend_data = get_installation_trend(start_date)
     users_data = get_unique_users(start_date)
-
-    # 确定状态筛选器
-    active_status_filter = None
-    if session_status_filter and "全部" not in session_status_filter:
-        if len(session_status_filter) == 1:
-            active_status_filter = session_status_filter[0]
-
-    # 获取筛选后的会话数据
-    recent_sessions = get_recent_sessions(20, start_date, active_status_filter)
 
     # 显示KPI卡片
     if stats:
@@ -813,6 +793,25 @@ with tab_installation:
 
     # 显示最近会话
     st.subheader("最近安装会话")
+
+    # 更新会话状态筛选器 - 使用水平单选按钮替代多选框
+    status_options = ["全部", "成功", "失败"]
+    session_status_filter = st.radio(
+        "会话状态筛选:",
+        options=status_options,
+        index=0,
+        horizontal=True,
+        help="选择需要查看的会话状态类型"
+    )
+    
+    # 简化状态筛选逻辑
+    active_status_filter = None
+    if session_status_filter != "全部":
+        active_status_filter = session_status_filter
+    
+    # 获取筛选后的会话数据
+    recent_sessions = get_recent_sessions(20, start_date, active_status_filter)
+
     if recent_sessions:
         # 创建会话表格
         sessions_df = pd.DataFrame(recent_sessions)
@@ -903,12 +902,6 @@ with tab_installation:
         st.info("暂无最近会话数据")
 
 with tab_user:
-    # 刷新按钮
-    col1, col2 = st.columns([1, 15])
-    with col1:
-        if st.button("🔄 刷新"):
-            st.cache_data.clear()
-            st.success("数据已刷新!")
 
     start_date = filter_by_date(date_filter)
 
